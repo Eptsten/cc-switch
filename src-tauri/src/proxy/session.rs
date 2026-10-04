@@ -47,10 +47,11 @@ pub struct SessionIdResult {
 ///
 /// ## 提取优先级
 ///
-/// ### Claude 请求
-/// 1. `metadata.user_id` (格式: `user_xxx_session_yyy`) → 提取 `yyy` 部分
-/// 2. `metadata.session_id` → 直接使用
-/// 3. 生成新 UUID
+/// ### Claude / Claude Desktop 请求
+/// 1. Headers: `x-claude-code-session-id` 或 `claude-code-session-id`
+/// 2. `metadata.user_id` (格式: `user_xxx_session_yyy`) → 提取 `yyy` 部分
+/// 3. `metadata.session_id` → 直接使用
+/// 4. 生成新 UUID（仅用于日志，不作为客户端缓存身份）
 ///
 /// ### Codex 请求
 /// 1. Headers: `session_id` 或 `x-session-id`
@@ -73,7 +74,7 @@ pub fn extract_session_id(
     body: &serde_json::Value,
     client_format: &str,
 ) -> SessionIdResult {
-    if client_format == "claude" {
+    if matches!(client_format, "claude" | "claude-desktop") {
         if let Some(result) = extract_claude_session(headers, body) {
             return result;
         }
@@ -234,6 +235,96 @@ mod tests {
     use serde_json::json;
 
     // ========== Session ID 提取测试 ==========
+
+    #[test]
+    fn claude_desktop_reuses_primary_session_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "desktop-session-123".parse().unwrap(),
+        );
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let first = extract_session_id(&headers, &body, "claude-desktop");
+        let second = extract_session_id(&headers, &body, "claude-desktop");
+
+        assert_eq!(first.session_id, "desktop-session-123");
+        assert_eq!(second.session_id, first.session_id);
+        for result in [first, second] {
+            assert_eq!(result.source, SessionIdSource::Header);
+            assert!(result.client_provided);
+        }
+    }
+
+    #[test]
+    fn claude_desktop_reuses_alternate_session_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "claude-code-session-id",
+            "desktop-session-123".parse().unwrap(),
+        );
+        let first = extract_session_id(&headers, &json!({}), "claude-desktop");
+        let second = extract_session_id(&headers, &json!({}), "claude-desktop");
+
+        assert_eq!(first.session_id, "desktop-session-123");
+        assert_eq!(second.session_id, first.session_id);
+        for result in [first, second] {
+            assert_eq!(result.source, SessionIdSource::Header);
+            assert!(result.client_provided);
+        }
+    }
+
+    #[test]
+    fn claude_desktop_keeps_distinct_sessions_isolated() {
+        let results: Vec<_> = ["session-A", "session-B"]
+            .iter()
+            .map(|session| {
+                let mut headers = HeaderMap::new();
+                headers.insert("x-claude-code-session-id", session.parse().unwrap());
+                extract_session_id(&headers, &json!({}), "claude-desktop")
+            })
+            .collect();
+
+        assert_eq!(results[0].session_id, "session-A");
+        assert_eq!(results[1].session_id, "session-B");
+        assert_ne!(results[0].session_id, results[1].session_id);
+        assert!(results.iter().all(|result| result.client_provided));
+    }
+
+    #[test]
+    fn claude_desktop_without_identity_generates_logging_only_uuid() {
+        let headers = HeaderMap::new();
+        let first = extract_session_id(&headers, &json!({}), "claude-desktop");
+        let second = extract_session_id(&headers, &json!({}), "claude-desktop");
+
+        assert_ne!(first.session_id, second.session_id);
+        for result in [first, second] {
+            assert!(Uuid::parse_str(&result.session_id).is_ok());
+            assert_eq!(result.source, SessionIdSource::Generated);
+            assert!(!result.client_provided);
+        }
+    }
+
+    #[test]
+    fn claude_desktop_and_claude_share_header_precedence_and_metadata_fallback() {
+        let body = json!({"metadata": {"session_id": "metadata-session"}});
+        for client_format in ["claude", "claude-desktop"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "claude-code-session-id",
+                "alternate-session".parse().unwrap(),
+            );
+            headers.insert("x-claude-code-session-id", "primary-session".parse().unwrap());
+            let result = extract_session_id(&headers, &body, client_format);
+            assert_eq!(result.session_id, "primary-session");
+            assert_eq!(result.source, SessionIdSource::Header);
+            assert!(result.client_provided);
+
+            let result = extract_session_id(&HeaderMap::new(), &body, client_format);
+            assert_eq!(result.session_id, "metadata-session");
+            assert_eq!(result.source, SessionIdSource::MetadataSessionId);
+            assert!(result.client_provided);
+        }
+    }
 
     #[test]
     fn test_extract_session_from_claude_metadata_user_id() {

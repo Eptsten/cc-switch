@@ -1928,6 +1928,14 @@ impl RequestForwarder {
             } else {
                 Vec::new()
             };
+        if should_send_codex_oauth_session_headers {
+            log::debug!(
+                "[Cache] app_type={}, codex_oauth_session_headers_sent={}, client_provided={}",
+                app_type.as_str(),
+                !codex_oauth_session_headers.is_empty(),
+                self.session_client_provided
+            );
+        }
 
         // 自定义 User-Agent：与 stream_check / model_fetch 共用 parse_custom_user_agent，
         // 运行时静默忽略非法值（前端在输入处给非阻断提示，不在保存时阻断）。
@@ -4301,6 +4309,60 @@ mod tests {
             map.get("x-codex-window-id"),
             Some(&HeaderValue::from_static("session-123:0"))
         );
+    }
+
+    #[test]
+    fn claude_desktop_cache_identity_survives_responses_conversion() {
+        let mut provider = test_provider_with_type(Some("codex_oauth"));
+        provider.settings_config = json!({
+            "env": {"ANTHROPIC_BASE_URL": "https://chatgpt.com/backend-api/codex"}
+        });
+        provider.meta.as_mut().unwrap().api_format = Some("openai_responses".to_string());
+        let body = json!({
+            "model": "gpt-6.1-sol",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 128
+        });
+        let convert = |session: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(session) = session {
+                headers.insert("x-claude-code-session-id", session.parse().unwrap());
+            }
+            let identity =
+                crate::proxy::session::extract_session_id(&headers, &body, "claude-desktop");
+            let client_session = identity
+                .client_provided
+                .then_some(identity.session_id.as_str());
+            let transformed = super::super::providers::transform_claude_request_for_api_format(
+                body.clone(),
+                &provider,
+                "openai_responses",
+                client_session,
+                None,
+            )
+            .unwrap();
+            let upstream_headers: HeaderMap = client_session
+                .map(build_codex_oauth_session_headers)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            (transformed, upstream_headers)
+        };
+
+        let (first, first_headers) = convert(Some("session-A"));
+        let (second, second_headers) = convert(Some("session-A"));
+        let (other, other_headers) = convert(Some("session-B"));
+        assert_eq!(first["prompt_cache_key"], "session-A");
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(other["prompt_cache_key"], "session-B");
+        assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
+        assert_eq!(first_headers, second_headers);
+        assert_eq!(first_headers["session_id"], "session-A");
+        assert_eq!(other_headers["session_id"], "session-B");
+
+        let (fallback, fallback_headers) = convert(None);
+        assert!(fallback.get("prompt_cache_key").is_none());
+        assert!(fallback_headers.is_empty());
     }
 
     #[test]

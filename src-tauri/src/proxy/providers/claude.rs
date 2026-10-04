@@ -391,9 +391,12 @@ pub fn transform_claude_request_for_api_format(
     match api_format {
         "openai_responses" => {
             log::debug!(
-                "[Cache] OpenAI Responses prompt_cache_key source={cache_key_source}, provider={}, codex_oauth={is_codex_oauth}, has_key={}",
+                "[Cache] OpenAI Responses prompt_cache_key source={cache_key_source}, provider={}, codex_oauth={is_codex_oauth}, has_key={}, cache_key_hash={}",
                 provider.id,
-                cache_key.is_some()
+                cache_key.is_some(),
+                cache_key
+                    .map(|key| crate::proxy::json_canonical::short_sha256_hex(key.as_bytes()))
+                    .unwrap_or_else(|| "absent".to_string())
             );
             // Codex OAuth (ChatGPT Plus/Pro 反代) 需要在请求体里强制 store: false
             // + include: ["reasoning.encrypted_content"]，由 transform 层统一处理。

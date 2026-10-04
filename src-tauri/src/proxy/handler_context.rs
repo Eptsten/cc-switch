@@ -115,11 +115,14 @@ impl RequestContext {
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
+        let session_hash = crate::proxy::json_canonical::short_sha256_hex(session_id.as_bytes());
 
         log::debug!(
-            "[{}] Session ID: {} (from {:?}, client_provided: {})",
+            "[{}] app_type={}, client_format={}, session_hash={}, source={:?}, client_provided={}",
             tag,
-            session_id,
+            app_type.as_str(),
+            app_type_str,
+            session_hash,
             session_result.source,
             session_result.client_provided
         );
@@ -132,12 +135,12 @@ impl RequestContext {
                 // 跟着关掉（见 `create_forwarder`）。
                 app_config.auto_failover_enabled = false;
                 log::debug!(
-                    "[{}] Stacked model {} → provider {}, upstream model {}, session: {}",
+                    "[{}] Stacked model {} → provider {}, upstream model {}, session_hash: {}",
                     tag,
                     target.original_model,
                     target.provider.name,
                     target.upstream_model,
-                    session_id
+                    session_hash
                 );
                 (
                     target.provider.clone(),
@@ -193,12 +196,12 @@ impl RequestContext {
                     .ok_or(ProxyError::NoAvailableProvider)?;
 
                 log::debug!(
-                    "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}",
+                    "[{}] Provider: {}, model: {}, failover chain: {} providers, session_hash: {}",
                     tag,
                     provider.name,
                     request_model,
                     providers.len(),
-                    session_id
+                    session_hash
                 );
                 (provider, providers, current_provider_id, request_model)
             }
