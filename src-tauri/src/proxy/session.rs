@@ -313,7 +313,10 @@ mod tests {
                 "claude-code-session-id",
                 "alternate-session".parse().unwrap(),
             );
-            headers.insert("x-claude-code-session-id", "primary-session".parse().unwrap());
+            headers.insert(
+                "x-claude-code-session-id",
+                "primary-session".parse().unwrap(),
+            );
             let result = extract_session_id(&headers, &body, client_format);
             assert_eq!(result.session_id, "primary-session");
             assert_eq!(result.source, SessionIdSource::Header);
