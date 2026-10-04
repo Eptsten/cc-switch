@@ -1,0 +1,132 @@
+name: Manual Windows Test Build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_SHA: ba8c1cd611b172054d2bf4859edef20549f4cf4c
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Frontend type check
+        id: typecheck
+        continue-on-error: true
+        run: pnpm typecheck
+      - name: Frontend unit tests
+        id: frontend_tests
+        continue-on-error: true
+        run: pnpm test:unit
+      - name: Rust check
+        id: rust_check
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - name: OAuth regression tests
+        id: oauth_tests
+        continue-on-error: true
+        run: cargo test --locked --lib --manifest-path src-tauri/Cargo.toml gpt6_compatible_identity
+      - name: Disable updater artifacts only in runner working directory
+        run: |
+          $config = 'src-tauri/tauri.conf.json'
+          Copy-Item $config "$env:RUNNER_TEMP/tauri.conf.original.json"
+          $text = Get-Content $config -Raw
+          if ($text -notmatch '"createUpdaterArtifacts": true') { throw 'Unexpected updater configuration' }
+          $text.Replace('"createUpdaterArtifacts": true', '"createUpdaterArtifacts": false') | Set-Content $config -Encoding utf8
+          git diff -- $config
+      - name: Build release executable and MSI
+        id: build
+        continue-on-error: true
+        run: pnpm tauri build --bundles msi
+      - name: Preserve executable and package portable
+        if: always()
+        run: |
+          $exe = 'src-tauri/target/release/cc-switch.exe'
+          if (!(Test-Path $exe)) { throw 'Release executable was not built' }
+          New-Item -ItemType Directory -Force test-artifacts, portable-stage | Out-Null
+          Copy-Item $exe test-artifacts/cc-switch.exe
+          Copy-Item $exe portable-stage/cc-switch.exe
+          @('# CC Switch portable build marker', 'portable=true') | Set-Content portable-stage/portable.ini -Encoding utf8
+          'WARNING: portable.ini does not isolate user configuration. Do not launch before reviewing shared configuration risk.' | Set-Content portable-stage/TEST_README.txt
+          Compress-Archive -Path portable-stage/* -DestinationPath test-artifacts/CC-Switch-3.20.4-Windows-x64-Test-Portable.zip
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Copy-Item -Destination test-artifacts
+      - name: Process startup smoke test on disposable runner
+        if: always()
+        id: smoke
+        continue-on-error: true
+        run: |
+          if (!(Test-Path test-artifacts/cc-switch.exe)) { throw 'No executable to test' }
+          $env:CC_SWITCH_TEST_HOME = Join-Path $env:RUNNER_TEMP 'cc-switch-smoke-home'
+          New-Item -ItemType Directory -Force $env:CC_SWITCH_TEST_HOME | Out-Null
+          $process = Start-Process -FilePath (Resolve-Path test-artifacts/cc-switch.exe) -WindowStyle Hidden -PassThru
+          Start-Sleep -Seconds 15
+          $process.Refresh()
+          if ($process.HasExited) { throw "Application exited early with code $($process.ExitCode)" }
+          Stop-Process -Id $process.Id -Force
+          'PASS: process survived 15 seconds; no OAuth login or routing test performed.' | Set-Content test-artifacts/SMOKE_TEST.txt
+      - name: Restore configuration and verify product source
+        if: always()
+        run: |
+          $original = "$env:RUNNER_TEMP/tauri.conf.original.json"
+          if (Test-Path $original) { Copy-Item $original src-tauri/tauri.conf.json -Force }
+          New-Item -ItemType Directory -Force test-artifacts | Out-Null
+          git diff --exit-code | Tee-Object test-artifacts/SOURCE_DIFF.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Tracked product source changed during CI' }
+      - name: Build information
+        if: always()
+        env:
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          FRONTEND_TESTS: ${{ steps.frontend_tests.outcome }}
+          RUST_CHECK: ${{ steps.rust_check.outcome }}
+          OAUTH_TESTS: ${{ steps.oauth_tests.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+        run: |
+          New-Item -ItemType Directory -Force test-artifacts | Out-Null
+          $source = Get-Content src-tauri/src/proxy/providers/codex_oauth_auth.rs -Raw
+          $version = [regex]::Match($source, 'CODEX_OAUTH_CLIENT_VERSION: &str = "([^"]+)"').Groups[1].Value
+          @(
+            "upstream commit SHA: $env:UPSTREAM_SHA"
+            "fork commit SHA: $env:GITHUB_SHA"
+            "build timestamp UTC: $([DateTime]::UtcNow.ToString('o'))"
+            "Node version: $(node --version)"
+            "pnpm version: $(pnpm --version)"
+            "rustc version: $(rustc --version)"
+            "cargo version: $(cargo --version)"
+            "runner OS: $env:RUNNER_OS $env:RUNNER_ARCH / $env:ImageOS / $env:ImageVersion"
+            "CODEX_OAUTH_CLIENT_VERSION: $version"
+            'build command: pnpm tauri build --bundles msi'
+            'updater artifacts temporarily disabled; configuration restored; no signing secrets used'
+            "typecheck: $env:TYPECHECK; frontend tests: $env:FRONTEND_TESTS; cargo check: $env:RUST_CHECK"
+            "OAuth regression tests: $env:OAUTH_TESTS; build: $env:BUILD; smoke: $env:SMOKE"
+            'Local warning: portable package may share installed-version user configuration.'
+          ) | Set-Content test-artifacts/BUILD_INFO.txt -Encoding utf8
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cc-switch-windows-x64-test
+          path: test-artifacts/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Require a usable release executable
+        if: always()
+        run: |
+          if (!(Test-Path test-artifacts/cc-switch.exe)) { throw 'No usable release executable produced' }
